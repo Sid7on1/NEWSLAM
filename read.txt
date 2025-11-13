@@ -1,0 +1,689 @@
+┌─────────────────────────────────────────────────────────────────────┐
+│                         INPUT TOKENS                                │
+│                    [batch, 32, vocab_size]                          │
+└───────────────────────────────┬─────────────────────────────────────┘
+                                │
+                    ┌───────────▼───────────┐
+                    │   Token Embedding     │
+                    │   [batch, 32, 64]     │
+                    └───────────┬───────────┘
+                                │
+        ╔═══════════════════════▼═══════════════════════╗
+        ║           LEVEL 1: MEMORY CREATION            ║
+        ║                                               ║
+        ║  ┌─────────────────────────────────────┐     ║
+        ║  │  Initial MoE Attention              │     ║
+        ║  │  • Computes Q, K, V                 │     ║
+        ║  │  • Caches K, V for later reuse      │     ║
+        ║  │  • Updates embeddings               │     ║
+        ║  └─────────────────────────────────────┘     ║
+        ║              │                                ║
+        ║              ├─► K_cached [32, 64] 🔒        ║
+        ║              └─► V_cached [32, 64] 🔒        ║
+        ╚═══════════════════════════════════════════════╝
+                                │
+        ╔═══════════════════════▼═══════════════════════╗
+        ║      LEVEL 2: ITERATIVE MULTI-PERSPECTIVE     ║
+        ║             REASONING (EF CYCLES)             ║
+        ║                                               ║
+        ║  ┌─────────────────────────────────────┐     ║
+        ║  │        EF CYCLE 1                   │     ║
+        ║  │  (4 rotations × 4 blocks)           │     ║
+        ║  └─────────────────────────────────────┘     ║
+        ║              │                                ║
+        ║  ┌───────────▼───────────────────────┐       ║
+        ║  │        EF CYCLE 2                 │       ║
+        ║  │  (processes updated embeddings)   │       ║
+        ║  └───────────┬───────────────────────┘       ║
+        ║              │                                ║
+        ║  ┌───────────▼───────────────────────┐       ║
+        ║  │        EF CYCLE 3                 │       ║
+        ║  │  (further refinement)             │       ║
+        ║  └───────────┬───────────────────────┘       ║
+        ║              │                                ║
+        ║  ┌───────────▼───────────────────────┐       ║
+        ║  │        EF CYCLE 4                 │       ║
+        ║  │  (final refinement)               │       ║
+        ║  └───────────┬───────────────────────┘       ║
+        ║              │                                ║
+        ║  All cycles use: K_cached 🔒, V_cached 🔒   ║
+        ╚═══════════════════════════════════════════════╝
+                                │
+        ╔═══════════════════════▼═══════════════════════╗
+        ║         LEVEL 3: FINAL SYNTHESIS              ║
+        ║                                               ║
+        ║  ┌─────────────────────────────────────┐     ║
+        ║  │  Final MoE Attention                │     ║
+        ║  │  • Consolidates all information     │     ║
+        ║  │  • Prepares for output              │     ║
+        ║  └─────────────────────────────────────┘     ║
+        ╚═══════════════════════════════════════════════╝
+                                │
+                    ┌───────────▼───────────┐
+                    │   Output Projection   │
+                    │   [batch, 32, vocab]  │
+                    └───────────┬───────────┘
+                                │
+                                ▼
+                         PREDICTIONS
+
+
+
+
+
+
+                         ┌──────────────────────────────────────────────────────────────────┐
+│                    LEVEL 1: MEMORY CREATION                      │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Input: x [batch, 32, 64]                                       │
+│         ↓                                                        │
+│  ┌─────────────────┐                                            │
+│  │   LayerNorm     │                                            │
+│  └────────┬────────┘                                            │
+│           │                                                      │
+│           ▼                                                      │
+│  ┌─────────────────────────────────────┐                       │
+│  │    MoE Attention Module             │                       │
+│  │                                     │                       │
+│  │  Step 1: Project to Q, K, V        │                       │
+│  │  ┌─────┐  ┌─────┐  ┌─────┐        │                       │
+│  │  │  Q  │  │  K  │  │  V  │        │                       │
+│  │  │proj │  │proj │  │proj │        │                       │
+│  │  └──┬──┘  └──┬──┘  └──┬──┘        │                       │
+│  │     │        │        │            │                       │
+│  │     │        ├────────┴─► CACHE 🔒│                       │
+│  │     │        │            K, V     │                       │
+│  │     │        │            stored   │                       │
+│  │     │        │            for all  │                       │
+│  │     │        │            cycles   │                       │
+│  │     │        │                     │                       │
+│  │  Step 2: Apply RoPE               │                       │
+│  │     │        │                     │                       │
+│  │  ┌──▼────┐ ┌▼─────┐               │                       │
+│  │  │Q+RoPE│ │K+RoPE│               │                       │
+│  │  └──┬────┘ └┬─────┘               │                       │
+│  │     │       │                     │                       │
+│  │  Step 3: Scaled Dot-Product Attn │                       │
+│  │     │       │                     │                       │
+│  │  scores = Q @ K^T / √d            │                       │
+│  │  weights = softmax(scores)        │                       │
+│  │  output = weights @ V             │                       │
+│  │     │                              │                       │
+│  └─────┼──────────────────────────────┘                       │
+│        │                                                       │
+│  ┌─────▼──────┐                                               │
+│  │  Residual  │  x = x + attn_output                         │
+│  │ Connection │                                               │
+│  └─────┬──────┘                                               │
+│        │                                                       │
+│        ▼                                                       │
+│  Output: Updated x [batch, 32, 64]                            │
+│          K_cached [batch, 32, num_heads, head_dim] 🔒        │
+│          V_cached [batch, 32, num_heads, head_dim] 🔒        │
+│                                                                │
+└──────────────────────────────────────────────────────────────────┘
+
+
+
+
+
+
+┌────────────────────────────────────────────────────────────────────┐
+│                ONE EF CYCLE (e.g., Cycle 1)                        │
+│                                                                    │
+│  Input: x [batch, 32, 64] (from Level 1 or previous cycle)       │
+│         K_cached, V_cached (from Level 1) 🔒                      │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  ┌────────────────────────────────────────────────────────────┐   │
+│  │             ROTATION 0 (No shift)                          │   │
+│  ├────────────────────────────────────────────────────────────┤   │
+│  │                                                            │   │
+│  │  Sequence: [t₀, t₁, t₂, ..., t₇, t₈, ..., t₁₅, t₁₆, ..., │   │
+│  │             t₂₃, t₂₄, ..., t₃₁]                           │   │
+│  │              │    │    │    │                              │   │
+│  │              ▼    ▼    ▼    ▼                              │   │
+│  │         ┌────┬────┬────┬────┐                             │   │
+│  │         │Seg1│Seg2│Seg3│Seg4│ (Split into 4)              │   │
+│  │         │0-7 │8-15│16-23│24-31│                           │   │
+│  │         └─┬──┴──┬─┴──┬─┴──┬─┘                             │   │
+│  │           │     │    │    │                                │   │
+│  │       ┌───▼┐ ┌─▼──┐ ┌▼──┐ ┌▼──┐                          │   │
+│  │       │Blk │ │Blk │ │Blk│ │Blk│                          │   │
+│  │       │ A  │ │ B  │ │ C │ │ D │                          │   │
+│  │       │    │ │    │ │   │ │   │                          │   │
+│  │       │Spec│ │Spec│ │Spec│ │Spec│                        │   │
+│  │       │Proj│ │Proj│ │Proj│ │Proj│                        │   │
+│  │       │ ↓  │ │ ↓  │ │ ↓ │ │ ↓ │                          │   │
+│  │       │MoE │ │MoE │ │MoE│ │MoE│                          │   │
+│  │       │Attn│ │Attn│ │Attn│ │Attn│                        │   │
+│  │       │(use│ │(use│ │(use│ │(use│                        │   │
+│  │       │ K,V│ │ K,V│ │ K,V│ │ K,V│                        │   │
+│  │       │🔒) │ │🔒) │ │🔒) │ │🔒) │                        │   │
+│  │       │ ↓  │ │ ↓  │ │ ↓ │ │ ↓ │                          │   │
+│  │       │MoE │ │MoE │ │MoE│ │MoE│                          │   │
+│  │       │FFN │ │FFN │ │FFN│ │FFN│                          │   │
+│  │       └─┬──┘ └─┬──┘ └┬──┘ └┬──┘                          │   │
+│  │         │      │     │     │                              │   │
+│  │         └──────┴─────┴─────┘                              │   │
+│  │                │                                           │   │
+│  │         ┌──────▼──────┐                                   │   │
+│  │         │ Concatenate │                                   │   │
+│  │         └──────┬──────┘                                   │   │
+│  │                │                                           │   │
+│  │         [t₀', t₁', ..., t₃₁']                             │   │
+│  └────────────────┬───────────────────────────────────────────┘   │
+│                   │                                               │
+│  ┌────────────────▼───────────────────────────────────────────┐   │
+│  │             ROTATION 1 (Shift by 8)                        │   │
+│  ├────────────────────────────────────────────────────────────┤   │
+│  │                                                            │   │
+│  │  Shifted: [t₈, t₉, ..., t₁₅, t₁₆, ..., t₂₃, t₂₄, ...,   │   │
+│  │            t₃₁, t₀, t₁, ..., t₇]                          │   │
+│  │              │    │    │    │                              │   │
+│  │              ▼    ▼    ▼    ▼                              │   │
+│  │         ┌────┬────┬────┬────┐                             │   │
+│  │         │Seg1│Seg2│Seg3│Seg4│                             │   │
+│  │         │8-15│16-23│24-31│0-7│ ← Note: different tokens! │   │
+│  │         └─┬──┴──┬─┴──┬─┴──┬─┘                             │   │
+│  │           │     │    │    │                                │   │
+│  │       ┌───▼┐ ┌─▼──┐ ┌▼──┐ ┌▼──┐                          │   │
+│  │       │Blk │ │Blk │ │Blk│ │Blk│                          │   │
+│  │       │ A  │ │ B  │ │ C │ │ D │                          │   │
+│  │       │    │ │    │ │   │ │   │                          │   │
+│  │       │(same blocks, different inputs!)                   │   │
+│  │       │    │ │    │ │   │ │   │                          │   │
+│  │       └─┬──┘ └─┬──┘ └┬──┘ └┬──┘                          │   │
+│  │         │      │     │     │                              │   │
+│  │         └──────┴─────┴─────┘                              │   │
+│  │                │                                           │   │
+│  │         ┌──────▼──────┐                                   │   │
+│  │         │ Concatenate │                                   │   │
+│  │         └──────┬──────┘                                   │   │
+│  │                │                                           │   │
+│  │         ┌──────▼──────┐                                   │   │
+│  │         │  Unrotate   │ (Shift back to original order)   │   │
+│  │         └──────┬──────┘                                   │   │
+│  │                │                                           │   │
+│  │         [t₀'', t₁'', ..., t₃₁'']                          │   │
+│  └────────────────┬───────────────────────────────────────────┘   │
+│                   │                                               │
+│  ┌────────────────▼───────────────────────────────────────────┐   │
+│  │             ROTATION 2 (Shift by 16)                       │   │
+│  │             ... (similar process)                          │   │
+│  └────────────────┬───────────────────────────────────────────┘   │
+│                   │                                               │
+│  ┌────────────────▼───────────────────────────────────────────┐   │
+│  │             ROTATION 3 (Shift by 24)                       │   │
+│  │             ... (similar process)                          │   │
+│  └────────────────┬───────────────────────────────────────────┘   │
+│                   │                                               │
+│  Now we have 4 versions of the 32 tokens:                        │
+│  - Version from Rotation 0: [t₀', t₁', ..., t₃₁']               │
+│  - Version from Rotation 1: [t₀'', t₁'', ..., t₃₁'']            │
+│  - Version from Rotation 2: [t₀''', t₁''', ..., t₃₁''']         │
+│  - Version from Rotation 3: [t₀'''', t₁'''', ..., t₃₁'''']      │
+│                   │                                               │
+│  ┌────────────────▼───────────────────────────────────────────┐   │
+│  │          LEARNABLE FUSION                                  │   │
+│  ├────────────────────────────────────────────────────────────┤   │
+│  │                                                            │   │
+│  │  Stack all 4 versions:                                    │   │
+│  │  stacked = [R0, R1, R2, R3] [4, batch, 32, 64]          │   │
+│  │                                                            │   │
+│  │  Compute fusion weights (per token):                      │   │
+│  │  fusion_scores = Linear(x) → [batch, 32, 4]             │   │
+│  │  fusion_weights = softmax(scores) → [batch, 32, 4]      │   │
+│  │                                                            │   │
+│  │  Example for token t₅:                                    │   │
+│  │  weights = [0.3, 0.2, 0.1, 0.4]                          │   │
+│  │                                                            │   │
+│  │  Weighted sum:                                             │   │
+│  │  t₅_final = 0.3×t₅_R0 + 0.2×t₅_R1 + 0.1×t₅_R2 + 0.4×t₅_R3│   │
+│  │                                                            │   │
+│  └────────────────┬───────────────────────────────────────────┘   │
+│                   │                                               │
+│                   ▼                                               │
+│  Output: Fused x [batch, 32, 64]                                 │
+│          (Contains information from all 4 rotations)              │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+
+
+
+
+
+┌────────────────────────────────────────────────────────────────────┐
+│                    EF BLOCK A (Structure Focus)                    │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  Input: segment [batch, 8, 64]  (8 tokens)                       │
+│         K_cached, V_cached from Level 1 🔒                        │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  STEP 1: Specialization Projection                       │    │
+│  ├──────────────────────────────────────────────────────────┤    │
+│  │                                                           │    │
+│  │  Input segment                                            │    │
+│  │       ↓                                                   │    │
+│  │  ┌────────────┐                                          │    │
+│  │  │ LayerNorm  │                                          │    │
+│  │  └─────┬──────┘                                          │    │
+│  │        │                                                  │    │
+│  │  ┌─────▼──────────┐                                      │    │
+│  │  │ Specialization │  Learned projection that            │    │
+│  │  │   Projection   │  transforms input to focus on       │    │
+│  │  │   (Linear)     │  structural patterns                │    │
+│  │  └─────┬──────────┘                                      │    │
+│  │        │                                                  │    │
+│  │  x_specialized [batch, 8, 64]                           │    │
+│  │                                                           │    │
+│  └───────────────────┬──────────────────────────────────────┘    │
+│                      │                                            │
+│  ┌───────────────────▼──────────────────────────────────────┐    │
+│  │  STEP 2: MoE Attention with Cached K, V                 │    │
+│  ├──────────────────────────────────────────────────────────┤    │
+│  │                                                           │    │
+│  │  Compute Q from x_specialized:                           │    │
+│  │  ┌─────────┐                                             │    │
+│  │  │ Q_proj  │                                             │    │
+│  │  └────┬────┘                                             │    │
+│  │       │                                                   │    │
+│  │  Q = [batch, 8, 64]  ← Fresh query from specialized x   │    │
+│  │                                                           │    │
+│  │  Use cached K, V:                                        │    │
+│  │  K = K_cached [batch, 32, 64] 🔒 ← From ALL 32 tokens  │    │
+│  │  V = V_cached [batch, 32, 64] 🔒 ← From ALL 32 tokens  │    │
+│  │                                                           │    │
+│  │  Attention:                                               │    │
+│  │  ┌───────────────────────────────────────────┐          │    │
+│  │  │  scores = Q @ K^T / √d                    │          │    │
+│  │  │                                            │          │    │
+│  │  │  Shape: [batch, 8, 32]                    │          │    │
+│  │  │         ↑      ↑   ↑                      │          │    │
+│  │  │         │      │   └─ Can attend to ALL   │          │    │
+│  │  │         │      │      32 positions!        │          │    │
+│  │  │         │      └─ 8 queries                │          │    │
+│  │  │         └─ batch                           │          │    │
+│  │  │                                            │          │    │
+│  │  │  weights = softmax(scores)                │          │    │
+│  │  │  output = weights @ V                     │          │    │
+│  │  │                                            │          │    │
+│  │  │  Output: [batch, 8, 64]                   │          │    │
+│  │  └───────────────────────────────────────────┘          │    │
+│  │       │                                                   │    │
+│  └───────┼──────────────────────────────────────────────────┘    │
+│          │                                                        │
+│  ┌───────▼──────────────────────────────────────────────────┐    │
+│  │  STEP 3: Residual Connection                             │    │
+│  ├──────────────────────────────────────────────────────────┤    │
+│  │                                                           │    │
+│  │  segment = segment + attn_output                         │    │
+│  │                                                           │    │
+│  └───────┬──────────────────────────────────────────────────┘    │
+│          │                                                        │
+│  ┌───────▼──────────────────────────────────────────────────┐    │
+│  │  STEP 4: Specialization Loss (Auxiliary)                │    │
+│  ├──────────────────────────────────────────────────────────┤    │
+│  │                                                           │    │
+│  │  Frequency Analyzer:                                      │    │
+│  │  ┌────────────────────┐                                  │    │
+│  │  │  Linear(64 → 4)    │  Projects to 4 frequency bands  │    │
+│  │  └─────────┬──────────┘                                  │    │
+│  │            │                                              │    │
+│  │  freq_scores = [batch, 8, 4]                            │    │
+│  │  freq_profile = softmax(mean(freq_scores))              │    │
+│  │               = [low, mid-low, mid-high, high]          │    │
+│  │                                                           │    │
+│  │  Target for Block A (Structure): [1.0, 0.5, 0.2, 0.1]  │    │
+│  │                                    ↑                     │    │
+│  │                                    └─ Prefers low freq  │    │
+│  │                                                           │    │
+│  │  Loss = KL_divergence(target, actual)                   │    │
+│  │                                                           │    │
+│  │  This loss encourages Block A to focus on low-frequency │    │
+│  │  (structural) patterns!                                  │    │
+│  │                                                           │    │
+│  └───────┬──────────────────────────────────────────────────┘    │
+│          │                                                        │
+│  ┌───────▼──────────────────────────────────────────────────┐    │
+│  │  STEP 5: MoE FFN                                         │    │
+│  ├──────────────────────────────────────────────────────────┤    │
+│  │                                                           │    │
+│  │  ┌───────────┐                                           │    │
+│  │  │ LayerNorm │                                           │    │
+│  │  └─────┬─────┘                                           │    │
+│  │        │                                                  │    │
+│  │  ┌─────▼─────────┐                                       │    │
+│  │  │  Gating Net   │  Selects top-2 experts per token     │    │
+│  │  └─────┬─────────┘                                       │    │
+│  │        │                                                  │    │
+│  │  ┌─────▼─────────┐                                       │    │
+│  │  │  4 Experts:   │                                       │    │
+│  │  │  E0, E1, E2, E3│  Only top-2 activated per token    │    │
+│  │  └─────┬─────────┘                                       │    │
+│  │        │                                                  │    │
+│  │  Output: [batch, 8, 64]                                 │    │
+│  │                                                           │    │
+│  └───────┬──────────────────────────────────────────────────┘    │
+│          │                                                        │
+│  ┌───────▼──────────────────────────────────────────────────┐    │
+│  │  STEP 6: Final Residual                                  │    │
+│  ├──────────────────────────────────────────────────────────┤    │
+│  │                                                           │    │
+│  │  segment = segment + ffn_output                          │    │
+│  │                                                           │    │
+│  └───────┬──────────────────────────────────────────────────┘    │
+│          │                                                        │
+│          ▼                                                        │
+│  Output: processed segment [batch, 8, 64]                        │
+│          (Now contains structural patterns + context)             │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+
+
+
+┌────────────────────────────────────────────────────────────────────┐
+│              TOKEN t₅ COMPLETE JOURNEY                             │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  INITIAL STATE:                                                    │
+│  t₅ = [0.1, 0.2, 0.3, ..., 0.5]  (64 dimensions)                 │
+│                                                                    │
+│  ╔════════════════════════════════════════════════════════════╗   │
+│  ║  LEVEL 1: Memory Creation                                 ║   │
+│  ╚════════════════════════════════════════════════════════════╝   │
+│                                                                    │
+│  • t₅ goes through initial attention                              │
+│  • Its K and V are computed and cached: k₅_cached, v₅_cached 🔒  │
+│  • t₅ updated: [0.15, 0.25, 0.35, ..., 0.55]                     │
+│                                                                    │
+│  ╔════════════════════════════════════════════════════════════╗   │
+│  ║  EF CYCLE 1                                                ║   │
+│  ╚════════════════════════════════════════════════════════════╝   │
+│                                                                    │
+│  Rotation 0:                                                       │
+│  ├─ t₅ at position 5 → falls in Segment 1 [t₀-t₇]               │
+│  ├─ Processed by Block A (Structure focus)                        │
+│  ├─ Creates fresh Q from t₅                                       │
+│  ├─ Uses cached k₅, v₅ and all other k_cached, v_cached         │
+│  └─ Output: t₅_R0 = [0.2, 0.3, ..., 0.6]                        │
+│                                                                    │
+│  Rotation 1 (shifted by 8):                                       │
+│  ├─ t₅ now at position 29 → falls in Segment 4 [t₂₄-t₃₁]       │
+│  ├─ Processed by Block D (Details focus)                         │
+│  ├─ Creates different Q from t₅ (different specialization)       │
+│  ├─ Uses same cached k₅, v₅                                      │
+│  └─ Output: t₅_R1 = [0.25, 0.35, ..., 0.65]                     │
+│                                                                    │
+│  Rotation 2 (shifted by 16):                                      │
+│  ├─ t₅ now at position 21 → falls in Segment 3 [t₁₆-t₂₃]       │
+│  ├─ Processed by Block C (Transitions focus)                     │
+│  └─ Output: t₅_R2 = [0.22, 0.32, ..., 0.62]                     │
+│                                                                    │
+│  Rotation 3 (shifted by 24):                                      │
+│  ├─ t₅ now at position 13 → falls in Segment 2 [t₈-t₁₅]        │
+│  ├─ Processed by Block B (Patterns focus)                        │
+│  └─ Output: t₅_R3 = [0.27, 0.37, ..., 0.67]                     │
+│                                                                    │
+│  Fusion:                                                           │
+│  ├─ Compute weights: [0.3, 0.2, 0.1, 0.4]                        │
+│  └─ t₅_cycle1 = 0.3×t₅_R0 + 0.2×t₅_R1 + 0.1×t₅_R2 + 0.4×t₅_R3  │
+│                = [0.24, 0.34, ..., 0.64]                          │
+│                                                                    │
+│  ╔════════════════════════════════════════════════════════════╗   │
+│  ║  EF CYCLE 2                                                ║   │
+│  ╚════════════════════════════════════════════════════════════╝   │
+│                                                                    │
+│  Input: t₅_cycle1 = [0.24, 0.34, ..., 0.64]  ← From Cycle 1     │
+│                                                                    │
+│  • Goes through same 4 rotations again                            │
+│  • But now with updated embedding!                                │
+│  • Creates NEW queries based on updated t₅                        │
+│  • Uses SAME cached K, V from Level 1 🔒                         │
+│  • Attention patterns are DIFFERENT (because Q is different)      │
+│                                                                    │
+│  Output: t₅_cycle2 = [0.35, 0.45, ..., 0.75]  ← More refined    │
+│                                                                    │
+│  ╔════════════════════════════════════════════════════════════╗   │
+│  ║  EF CYCLE 3                                                ║   │
+│  ╚════════════════════════════════════════════════════════════╝   │
+│                                                                    │
+│  Input: t₅_cycle2 (even more refined)                            │
+│  Output: t₅_cycle3 = [0.45, 0.55, ..., 0.85]                    │
+│                                                                    │
+│  ╔════════════════════════════════════════════════════════════╗   │
+│  ║  EF CYCLE 4                                                ║   │
+│  ╚════════════════════════════════════════════════════════════╝   │
+│                                                                    │
+│  Input: t₅_cycle3 (highly refined)                               │
+│  Output: t₅_cycle4 = [0.55, 0.65, ..., 0.95]                    │
+│                                                                    │
+│  ╔════════════════════════════════════════════════════════════╗   │
+│  ║  LEVEL 3: Final Synthesis                                 ║   │
+│  ╚════════════════════════════════════════════════════════════╝   │
+│                                                                    │
+│  • t₅_cycle4 goes through final attention                        │
+│  • Final consolidation of all information                         │
+│  • Output: t₅_final = [0.65, 0.75, ..., 1.05]                   │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  t₅_final now contains:                                  │    │
+│  │  ✓ Original token information                            │    │
+│  │  ✓ Context from all other tokens (via K, V)             │    │
+│  │  ✓ Structural patterns (Block A)                         │    │
+│  │  ✓ Pattern details (Block B)                             │    │
+│  │  ✓ Transition information (Block C)                      │    │
+│  │  ✓ Fine details (Block D)                                │    │
+│  │  ✓ 4 different perspectives per cycle                    │    │
+│  │  ✓ 4 cycles of iterative refinement                      │    │
+│  │  ✓ Total: 16 views × 4 cycles = 64 processing steps!    │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                                    │
+│  ┌──────────────────────────────────────────────────────────┐    │
+│  │  Output Projection                                        │    │
+│  └──────────────────────────────────────────────────────────┘    │
+│                                                                    │
+│  logits = W_out @ t₅_final                                       │
+│         = [vocab_size] probability distribution                   │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+
+
+
+┌────────────────────────────────────────────────────────────────────┐
+│                  COMPUTATIONAL TIMELINE                            │
+├────────────────────────────────────────────────────────────────────┤
+│                                                                    │
+│  TIME 0: Initialization                                            │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━                                      │
+│  • Load model weights                                              │
+│  • Initialize all parameters                                       │
+│                                                                    │
+│  TIME 1: Level 1 Processing                                        │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                   │
+│  • Input: Raw token embeddings [32, 64]                           │
+│  • Compute Q, K, V from embeddings                                │
+│  • CACHE K and V 🔒 (stored for entire forward pass)             │
+│  • Compute attention: Q @ K^T → weights → weights @ V            │
+│  • Output: Updated embeddings [32, 64]                            │
+│  • K_cached, V_cached stored in memory                            │
+│                                                                    │
+│  TIME 2: EF Cycle 1, Rotation 0                                   │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                             │
+│  • Input: Embeddings from Level 1 [32, 64]                       │
+│  • Split into 4 segments [8, 64] each                            │
+│  • Block A: segment 0-7                                           │
+│    ├─ Specialization projection                                   │
+│    ├─ Compute Q_new from projected segment                        │
+│    ├─ Use K_cached, V_cached 🔒                                  │
+│    ├─ Attention                                                    │
+│    └─ FFN                                                          │
+│  • Block B, C, D: similar (parallel)                              │
+│  • Concatenate outputs → [32, 64]                                 │
+│                                                                    │
+│  TIME 3: EF Cycle 1, Rotation 1                                   │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                             │
+│  • Rotate embeddings by 8 positions                               │
+│  • Process through blocks A, B, C, D                              │
+│  • Use SAME K_cached, V_cached 🔒                                │
+│  • Unrotate output                                                 │
+│                                                                    │
+│  TIME 4: EF Cycle 1, Rotations 2 & 3                             │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                            │
+│  • Similar to Rotation 1                                           │
+│                                                                    │
+│  TIME 5: EF Cycle 1, Fusion                                       │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                │
+│  • Have 4 versions of embeddings [4, 32, 64]                     │
+│  • Compute fusion weights per token                               │
+│  • Weighted sum → [32, 64]                                        │
+│                                                                    │
+│  TIME 6-9: EF Cycles 2, 3, 4                                      │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                │
+│  • Similar to Cycle 1                                              │
+│  • Input: UPDATED embeddings from previous cycle                  │
+│  • K_cached, V_cached: STILL THE SAME 🔒                         │
+│  • Output: Progressively refined embeddings                       │
+│                                                                    │
+│  TIME 10: Level 3 Processing                                       │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                │
+│  • Input: Final embeddings from Cycle 4 [32, 64]                 │
+│  • Final attention layer                                           │
+│  • Output: Fully processed embeddings [32, 64]                    │
+│                                                                    │
+│  TIME 11: Output Projection                                        │
+│  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━                                  │
+│  • Linear projection to vocabulary                                 │
+│  • Output: Logits [32, vocab_size]                               │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+
+
+
+
+
+
+LEVEL 1:
+    x₀ → [Q₀, K₀, V₀]
+          ↓    ↓   ↓
+          ↓    └───┴─► CACHE 🔒
+          ↓
+      Attention
+          ↓
+         x₁
+
+CYCLE 1:
+    x₁ → Q₁ (NEW!)
+         ↓
+    Q₁ × K₀ (CACHED) × V₀ (CACHED)
+         ↓
+    Attention → x₂
+
+CYCLE 2:
+    x₂ → Q₂ (NEW, different from Q₁!)
+         ↓
+    Q₂ × K₀ (SAME!) × V₀ (SAME!)
+         ↓
+    Attention → x₃
+
+Pattern: Q evolves, K/V stay fixed!
+
+
+
+ORIGINAL:
+[t₀, t₁, t₂, t₃, t₄, t₅, t₆, t₇, t₈, ..., t₂₈, t₂₉, t₃₀, t₃₁]
+ └────── Seg1 ──────┘ └────── Seg2 ──────┘ └─── Seg3 ───┘ └─ Seg4 ─┘
+    Block A             Block B              Block C        Block D
+
+ROTATION 1 (Shift by 8):
+[t₈, t₉, ..., t₁₅, t₁₆, ..., t₂₃, t₂₄, ..., t₃₁, t₀, t₁, ..., t₇]
+ └────── Seg1 ──────┘ └────── Seg2 ──────┘ └─── Seg3 ───┘ └─ Seg4 ─┘
+    Block A             Block B              Block C        Block D
+    
+Now t₅ goes through Block D instead of Block A!
+Every token visits every block across rotations!
+
+
+
+
+┌─────────────────────────────────────────────────────────┐
+│  Block A: Structure (Low Frequency)                     │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │ Target: [████████░░░░░░░░░░]  Low freq            │  │
+│  │ Actual: [████████░░░░░░░░░░]  Matches target!     │  │
+│  └───────────────────────────────────────────────────┘  │
+│                                                         │
+│  Block B: Patterns (Mid Frequency)                      │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │ Target: [░░░░████████████░░░░]  Mid freq          │  │
+│  │ Actual: [░░░░████████████░░░░]  Matches target!   │  │
+│  └───────────────────────────────────────────────────┘  │
+│                                                         │
+│  Block C: Transitions (Mid-High Frequency)              │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │ Target: [░░░░░░░░████████████]  Mid-high freq     │  │
+│  │ Actual: [░░░░░░░░████████████]  Matches target!   │  │
+│  └───────────────────────────────────────────────────┘  │
+│                                                         │
+│  Block D: Details (High Frequency)                      │
+│  ┌───────────────────────────────────────────────────┐  │
+│  │ Target: [░░░░░░░░░░░░████████]  High freq         │  │
+│  │ Actual: [░░░░░░░░░░░░████████]  Matches target!   │  │
+│  └───────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+
+Auxiliary loss encourages each block to focus on its target!
+
+
+
+
+┌──────────────────────────────────────────────────────────────────┐
+│                    INFORMATION ACCUMULATION                      │
+├──────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│  Level 1:    x + basic_context                                  │
+│              ↓                                                   │
+│  Cycle 1:    x + basic_context + 16_perspectives                │
+│              ↓                                                   │
+│  Cycle 2:    x + basic_context + 32_perspectives                │
+│              ↓                                                   │
+│  Cycle 3:    x + basic_context + 48_perspectives                │
+│              ↓                                                   │
+│  Cycle 4:    x + basic_context + 64_perspectives                │
+│              ↓                                                   │
+│  Level 3:    x + basic_context + 64_perspectives + final_synth  │
+│                                                                  │
+│  Each embedding becomes progressively richer!                    │
+│                                                                  │
+└──────────────────────────────────────────────────────────────────┘
+
+
+
+
+✨ Summary
+The Fixed SLAM3 Architecture:
+
+Level 1: Creates stable memory (cached K, V)
+Level 2: Iterative multi-perspective reasoning
+
+4 cycles of refinement
+Each cycle: 4 rotations × 4 specialized blocks = 16 views
+Total: 64 perspectives per token!
+
+
+Level 3: Final synthesis
+
+Key Innovations:
+
+✅ Fixed K, V with evolving Q (stable memory + adaptive queries)
+✅ Rotation ensures every token sees every block type
+✅ Enforced specialization through auxiliary loss
+✅ Learnable fusion of multiple perspectives
+✅ Iterative refinement across cycles
+
+Result: Each token's final embedding contains rich, multi-perspective, iteratively-refined contextual information! 🚀2 / 2RetryClaude can make mistakes. Please double-check responses.
