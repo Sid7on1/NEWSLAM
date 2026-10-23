@@ -32,7 +32,7 @@ class SLAM3Config:
 
     # Training
     LEARNING_RATE = 3e-4
-    BATCH_SIZE = 16          # Adjust based on GPU memory
+    BATCH_SIZE = 32          # 32 per GPU = 64 total with 2 GPUs (DataParallel auto-splits)
     DROPOUT = 0.1
     GRAD_CLIP = 1.0
     WARMUP_STEPS = 500
@@ -44,7 +44,7 @@ class SLAM3Config:
 
     # Checkpointing
     SAVE_EVERY = 500
-    EVAL_EVERY = 100
+    EVAL_EVERY = 2000
     LOG_EVERY = 10
 
     def validate(self):
@@ -85,6 +85,11 @@ class MetricsTracker:
             'spec_loss': [],
             'step_time': [],
             'learning_rate': [],
+            'grad_norm': [],
+            'val_loss': [],
+            'val_perplexity': [],
+            'val_accuracy': [],
+            'val_top5_accuracy': [],
         }
 
     def update(self, **kwargs):
@@ -303,7 +308,7 @@ class SparseTopKMoEFFN(nn.Module):
 
         return load_balance_loss
 
-    def forward(self, x):
+    def forward(self, x, return_loss=False):
         batch_size, seq_len, embed_dim = x.shape
 
         # Compute gating scores
@@ -318,7 +323,8 @@ class SparseTopKMoEFFN(nn.Module):
         top_k_probs = F.softmax(top_k_logits, dim=-1)
 
         # Compute load balance loss
-        self.last_load_balance_loss = self.compute_load_balance_loss(gate_logits, top_k_indices)
+        lb_loss = self.compute_load_balance_loss(gate_logits, top_k_indices)
+        self.last_load_balance_loss = lb_loss  # Keep for backward compatibility
 
         # Sparse computation
         output = torch.zeros_like(x)
@@ -338,6 +344,8 @@ class SparseTopKMoEFFN(nn.Module):
                 expert_output = self.experts[expert_idx](x)
                 output += expert_output * expert_weights.unsqueeze(-1)
 
+        if return_loss:
+            return output, lb_loss
         return output
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -394,7 +402,7 @@ class EFBlock(nn.Module):
 
         return kl_loss
 
-    def forward(self, x, cached_k=None, cached_v=None, use_cached_kv=False):
+    def forward(self, x, cached_k=None, cached_v=None, use_cached_kv=False, return_loss=False):
         # Specialization transformation
         x_normed = self.norm1(x)
         x_specialized = self.specialization_proj(x_normed)
@@ -409,13 +417,21 @@ class EFBlock(nn.Module):
         x = x + attn_out
 
         # Compute specialization loss
-        self.last_specialization_loss = self.compute_specialization_loss(attn_out)
+        spec_loss = self.compute_specialization_loss(attn_out)
+        self.last_specialization_loss = spec_loss  # Keep for backward compatibility
 
         # FFN
-        ffn_out = self.ffn(self.norm2(x))
+        if return_loss:
+            ffn_out, lb_loss = self.ffn(self.norm2(x), return_loss=True)
+        else:
+            ffn_out = self.ffn(self.norm2(x), return_loss=False)
+            lb_loss = None
+
         ffn_out = self.dropout(ffn_out)
         x = x + ffn_out
 
+        if return_loss:
+            return x, {'lb_loss': lb_loss, 'spec_loss': spec_loss}
         return x
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -435,7 +451,7 @@ class MultiRotationEFCycle(nn.Module):
 
         self.fusion_gate = nn.Linear(embed_dim, num_rotations)
 
-    def forward(self, x, cached_k=None, cached_v=None, use_cached_kv=False):
+    def forward(self, x, cached_k=None, cached_v=None, use_cached_kv=False, return_loss=False):
         batch_size, seq_len, embed_dim = x.shape
 
         # Ensure divisibility
@@ -449,6 +465,8 @@ class MultiRotationEFCycle(nn.Module):
 
         # Process rotations
         all_rotation_outputs = []
+        all_lb_losses = []
+        all_spec_losses = []
 
         for rotation_idx in range(self.num_rotations):
             shift = (rotation_idx * seq_len // self.num_rotations) % seq_len
@@ -461,7 +479,13 @@ class MultiRotationEFCycle(nn.Module):
                 end = start + seg_len
                 seg = rotated_x[:, start:end, :]
 
-                processed_seg = block(seg, cached_k, cached_v, use_cached_kv)
+                if return_loss:
+                    processed_seg, losses = block(seg, cached_k, cached_v, use_cached_kv, return_loss=True)
+                    all_lb_losses.append(losses['lb_loss'])
+                    all_spec_losses.append(losses['spec_loss'])
+                else:
+                    processed_seg = block(seg, cached_k, cached_v, use_cached_kv, return_loss=False)
+
                 rotation_outputs.append(processed_seg)
 
             rotation_result = torch.cat(rotation_outputs, dim=1)
@@ -483,6 +507,12 @@ class MultiRotationEFCycle(nn.Module):
         # Trim to original length
         if final_output.shape[1] != original_seq_len:
             final_output = final_output[:, :original_seq_len, :]
+
+        if return_loss:
+            # Average losses
+            avg_lb_loss = torch.stack(all_lb_losses).mean() if all_lb_losses else torch.tensor(0.0, device=x.device)
+            avg_spec_loss = torch.stack(all_spec_losses).mean() if all_spec_losses else torch.tensor(0.0, device=x.device)
+            return final_output, {'lb_loss': avg_lb_loss, 'spec_loss': avg_spec_loss}
 
         return final_output
 
@@ -542,6 +572,10 @@ class DynamicSLAM3Encoder(nn.Module):
         # Early stopping
         self.entropy_proj = nn.Linear(cfg.EMBED_DIM, 1)
 
+        # Initialize loss trackers
+        self.load_balance_loss = torch.tensor(0.0)
+        self.specialization_loss = torch.tensor(0.0)
+
     def compute_entropy(self, x):
         """Compute entropy for early stopping"""
         entropy_scores = self.entropy_proj(x)
@@ -562,9 +596,20 @@ class DynamicSLAM3Encoder(nn.Module):
         num_cycles = self.max_ef_cycles if training else self.max_ef_cycles
         cycles_executed = 0
 
+        # Collect losses during training
+        all_lb_losses = []
+        all_spec_losses = []
+
         for cycle_idx in range(num_cycles):
             prev_x = x
-            x = self.ef_cycles[cycle_idx](x, cached_k, cached_v, use_cached_kv=True)
+
+            if training:
+                x, losses = self.ef_cycles[cycle_idx](x, cached_k, cached_v, use_cached_kv=True, return_loss=True)
+                all_lb_losses.append(losses['lb_loss'])
+                all_spec_losses.append(losses['spec_loss'])
+            else:
+                x = self.ef_cycles[cycle_idx](x, cached_k, cached_v, use_cached_kv=True, return_loss=False)
+
             cycles_executed += 1
 
             # Early stopping in inference
@@ -576,8 +621,20 @@ class DynamicSLAM3Encoder(nn.Module):
         # Level 3
         x = x + self.level3_attn(self.norm2(x))
 
+        # Store losses for retrieval
+        if training and all_lb_losses:
+            self.load_balance_loss = torch.stack(all_lb_losses).mean()
+            self.specialization_loss = torch.stack(all_spec_losses).mean()
+        else:
+            self.load_balance_loss = torch.tensor(0.0, device=x.device)
+            self.specialization_loss = torch.tensor(0.0, device=x.device)
+
         if return_info:
-            return x, {'cycles_executed': cycles_executed}
+            info = {'cycles_executed': cycles_executed}
+            if training and all_lb_losses:
+                info['lb_loss'] = self.load_balance_loss
+                info['spec_loss'] = self.specialization_loss
+            return x, info
         return x
 
     def forward_with_logits(self, x, training=True):
@@ -621,6 +678,14 @@ class SLAM3Model(nn.Module):
     def count_parameters(self):
         """Count total parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def get_load_balance_loss(self):
+        """Get load balancing loss from MoE layers"""
+        return self.encoder.load_balance_loss
+
+    def get_specialization_loss(self):
+        """Get specialization loss from MoE layers"""
+        return self.encoder.specialization_loss
 
 
 if __name__ == '__main__':
