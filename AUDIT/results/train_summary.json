@@ -1,0 +1,24 @@
+[
+  {
+    "model": "slam",
+    "steps": 400,
+    "tokens_seen": 409600,
+    "final_val_ce": 7.0223,
+    "final_val_ppl": 1121.35,
+    "best_val_ppl": 1121.35,
+    "median_step_s": 2.225,
+    "train_tokens_per_s": 460.1,
+    "wall_s": 1160.0
+  },
+  {
+    "model": "baseline",
+    "steps": 400,
+    "tokens_seen": 409600,
+    "final_val_ce": 6.9706,
+    "final_val_ppl": 1064.85,
+    "best_val_ppl": 1064.85,
+    "median_step_s": 1.761,
+    "train_tokens_per_s": 581.3,
+    "wall_s": 955.1
+  }
+]

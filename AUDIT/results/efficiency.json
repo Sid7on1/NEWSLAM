@@ -1,0 +1,48 @@
+{
+  "hardware": "Linux VM, 2 vCPU, torch CPU, 2 threads, no GPU",
+  "params": {
+    "slam": 15837250,
+    "baseline": 15890385
+  },
+  "params_diff_pct": 0.34,
+  "inference_latency_batch1": {
+    "seq128": {
+      "slam_fwd_s": 0.0955,
+      "baseline_fwd_s": 0.0706,
+      "slam_ms_per_token": 0.746,
+      "baseline_ms_per_token": 0.552,
+      "slam_slower_x": 1.35
+    },
+    "seq512": {
+      "slam_fwd_s": 0.3098,
+      "baseline_fwd_s": 0.295,
+      "slam_ms_per_token": 0.605,
+      "baseline_ms_per_token": 0.576,
+      "slam_slower_x": 1.05
+    }
+  },
+  "kv_cache": {
+    "note": "SLAM's persistent cache is a single Level-1 K/V bank (measured from its real cache tensors). Baseline figure is the standard per-layer KV cache a decoder of its shape would keep. CAVEAT: SLAM's cache is NOT an autoregressive inference cache \u2014 it is computed once from the full input sequence (which is also why it leaks future information); the memory saving and the causality bug are the same design decision.",
+    "seq128": {
+      "slam_cache_bytes": 131072,
+      "baseline_standard_cache_bytes": 1966080,
+      "ratio": 15.0
+    },
+    "seq512": {
+      "slam_cache_bytes": 524288,
+      "baseline_standard_cache_bytes": 7864320,
+      "ratio": 15.0
+    },
+    "seq1024": {
+      "slam_cache_bytes": 1048576,
+      "baseline_standard_cache_bytes": 15728640,
+      "ratio": 15.0
+    },
+    "seq4096": {
+      "slam_cache_bytes": 4194304,
+      "baseline_standard_cache_bytes": 62914560,
+      "ratio": 15.0
+    }
+  },
+  "peak_rss_mb": 501.2
+}

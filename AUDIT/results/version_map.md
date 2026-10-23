@@ -1,0 +1,16 @@
+# SLAM Version Map (compiled 2026-10-23, from direct reads)
+
+| # | Version | Location | Date | Framework | Actually implements | Completeness |
+|---|---------|----------|------|-----------|--------------------|--------------|
+| 1 | v1 (~/SLAM folder) | Mac ~/SLAM (slam_model.py 703 lines) | Apr–May 2025 | PyTorch | Encoder: BERT tokenizer (vocab 30522), embed 768, global MHSA → Encoder-Fusion cycles (overlapping segments, averaged) → refinement block w/o residuals; MLM + IMDB heads | Code complete; NO results/logs/checkpoints (only 1.3KB slam_config.pt) |
+| 1g | v1 GitHub | Sid7on1/SLAM-v1 (slam.py 195 lines — a *different, smaller* file than Mac slam_model.py) | May 2025 | PyTorch | Plain MHSA encoder blocks + EF cycles param | Toy extract; not the Mac v1 |
+| 2 | v2 (slam-bigg) | Mac ~/Desktop/DEV/Projects/SLAM/slam-bigg (model_slam2.py 48.8KB) + GitHub Sid7on1/SLAM-v2 (slam_v2.py) | Apr–May 2025 | PyTorch | MoEAttention encoder (20 experts), EF cycles, classifier wrapper; Mac has 190MB emergency_model.pt + checkpoints | Code + training scripts; no verified result files |
+| 3s | "v3" skeleton (SALM) | Mac ~/SALM-MUTLIMODEL/slam_v3_encoder.py | May 2025 | PyTorch | Structure only — file literally labels itself "Placeholder": SimpleTokenizer=[ord(c)], apply_rope=no-op, MoE gating=uniform average, kv_cache=(x,x) tuple | PLACEHOLDER — never cite |
+| 3m | slam-v3 (Mac folder) | Mac ~/Desktop/DEV/Projects/SLAM/slam-v3 (main.py 2,981B) | May 2025 | PyTorch | Tiny stub | Stub |
+| 3 | **NEWSLAM = PyTorch v3 (CANONICAL)** | Mac ~/Desktop/DEV/Projects/SLAM/NEWSLAM/slam3_pytorch.py, **715 lines, 2025-11-17** | Nov 2025 | PyTorch | Real RoPE, MoE-attention module, SparseTopK MoE FFN, Level-1 KV cache + fresh-Q, multi-rotation EF cycles, specialization loss, entropy early-exit (inference) | Model code complete; NO training loop in file (notebooks only, unexecuted); own README: v0.9 "Incomplete, hasn't been trained to completion" |
+| 3g | NEWSLAM GitHub | Sid7on1/NEWSLAM (slam3_pytorch.py 650 lines) | code Nov 14 2025; README-only commit May 23 2026 | PyTorch | Same model, OLDER code (diff = 118 diff-lines: Mac adds return_loss plumbing, val metrics tracking, BATCH 32, EVAL_EVERY 2000) | Older than Mac — Mac is canonical |
+| 4 | slam-v4 | Mac ~/Desktop/DEV/Projects/SLAM/slam-v4 (slam_v4_model.py 23.7KB, has tests/) | Jul 2025 | PyTorch | v4 model iteration | Not benchmarked here (superseded by NEWSLAM chronologically in Sid's focus; noted for lineage) |
+| 5/6 | VSLAM suite | Mac ~/Desktop/DEV/Projects/SLAM/VSLAM (models/: v4, v4_champion, v5, v6_simple, v6_jamba_killer, v6_cortex_r_* + reference models) | Jul–Nov 2025 | **MLX** (Apple-only) | Architecture sweep harness ("Rocket Engine"), synthetic task embed256/vocab5000/seq32 | Harness results exist but broken: parameter_count=0 for ALL models, 5-step loss histories, inconsistent final PPL vs history — NOT resume-grade |
+| 6g | "SLAM-v3" GitHub | Sid7on1/SLAM-v3 (SLAMog.py) | Jul 2025 | MLX | Actually the MLX **v6 "Jamba Killer"** code; README's multimodal/MLA/ViT claims not implemented in the file | Mislabeled repo |
+
+CANONICAL BENCHMARK TARGET: Mac NEWSLAM slam3_pytorch.py (715 lines) — newest PyTorch code, superset of GitHub version, and the file Sid's resume claims were based on.
